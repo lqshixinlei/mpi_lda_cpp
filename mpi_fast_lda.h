@@ -32,7 +32,6 @@ public:
   void compute_s(const int &old_topic, const int &new_topic); 
   void compute_r(const int &doc);
   void compute_r(const int &doc, const int &old_topic, const int &new_topic); 
-  void compute_q(const int &doc, const int &word);
   void compute_q(const int &doc, const int &word, const int &topic);
   void compute_deno_cache();
   void compute_deno_cache(const int &old_topic, const int &new_topic);
@@ -43,6 +42,9 @@ public:
   void compute_r_cache(const int &doc, const int &old_topic, const int &new_topic);
   void compute_q_cache(const int &doc);
   void compute_q_cache(const int &doc, const int &old_topic, const int &new_topic);
+  void assign_last_z();
+  void compute_update();
+  void update();
   void estimate();
   int sampling(const int &m, const int &n);
   void compute_theta();
@@ -59,11 +61,12 @@ public:
   unordered_map<string, int> word_id_dict;
   unordered_map<int, string> id_word_dict;
   vector< vector<int> > trn_data;
-  sparse_matrix nwk, nwkp, ndk; 
+  sparse_matrix nwk, nwkp, ndk, nwk_update; 
   double s, r, q, **theta, **phi, ab, bv, *deno_cache, *s_cache, *r_cache, *q_cache;
   int **z, **last_z;
-  int *nksum, *ndsum;
-  row_element *row;
+  int *nksum, *ndsum, *nksump;
+  vector<int> update_element_vec;
+  int *update_element;
 };
 
 lda::lda(const int &t, const double &a, const double &b, const int &i) {
@@ -76,9 +79,10 @@ lda::lda(const int &t, const double &a, const double &b, const int &i) {
   theta = NULL;
   phi = NULL;
   z = NULL;
+  last_z = NULL;
   nksum = NULL;
   ndsum = NULL;
-  row = (row_element *)malloc(topic*sizeof(row_element));
+  nksump = NULL;
   deno_cache = (double *)malloc(topic*sizeof(double));
   s_cache = (double *)malloc(topic*sizeof(double));
   r_cache = (double *)malloc(topic*sizeof(double));
@@ -107,9 +111,13 @@ lda::~lda() {
     for (int i = 0; i < M; ++i) free(z[i]);
     free(z);
   }
+  if (last_z != NULL) {
+    for (int i = 0; i < M; ++i) free(last_z[i]);
+    free(last_z);
+  }
   if (nksum != NULL) free(nksum);
   if (ndsum != NULL) free(ndsum);
-  if (row != NULL) free(row);
+  if (nksump != NULL) free(nksump);
   if (deno_cache != NULL) free(deno_cache);
   if (s_cache != NULL) free(s_cache);
   if (r_cache != NULL) free(r_cache);
@@ -166,12 +174,18 @@ void lda::init_est() {
   std::cout << "words_dict_sz:" << words_dict_sz << std::endl;
   int M = trn_data.size();
   z = (int **)malloc(M*sizeof(int*));
+  last_z = (int **)malloc(M*sizeof(int*));
   for (int m = 0; m < M; ++m) {
     int N = trn_data[m].size();
     z[m] = (int *)malloc(N*sizeof(N));
+    last_z[m] = (int *)malloc(N*sizeof(N));
   }
   nksum = (int *)malloc(topic*sizeof(int));
-  for (int k = 0; k < topic; k++) nksum[k] = 0;
+  nksump = (int *)malloc(topic*sizeof(int));
+  for (int k = 0; k < topic; k++) {
+    nksum[k] = 0;
+    nksump[k] = 0;
+  }
   ndsum = (int *)malloc(M*sizeof(int));
   for (int m = 0; m < M; m++) ndsum[m] = 0;
   nwk.row = words_dict_sz;
@@ -183,6 +197,9 @@ void lda::init_est() {
   nwkp.row = words_dict_sz;
   nwkp.col = topic;
   nwkp.init_matrix();
+  nwk_update.row = words_dict_sz;
+  nwk_update.col = topic;
+  nwk_update.init_matrix();
   srandom((int)time(0));
   for (int m = 0; m < M; ++m) {
     int N = trn_data[m].size();
@@ -266,24 +283,6 @@ inline void lda::compute_r_cache(const int &doc, const int &old_topic, const int
   r_cache[old_topic] = ndk.get(doc, old_topic)*beta/(deno_cache[old_topic]);
   r_cache[new_topic] = ndk.get(doc, new_topic)*beta/(deno_cache[new_topic]);
 }
-inline void lda::compute_q(const int &doc, const int &word) {
-  compute_q_cache(doc);
-  q = 0;
-  int cnt; 
-  double q0, q1, q2, q3;
-  bool ret = nwk.get_row(cnt, row, word);
-  int k = 0;
-  for (; (k+4) < cnt; k+=4) {
-    q0 += q_cache[row[k].col]*row[k].val;
-    q1 += q_cache[row[k+1].col]*row[k+1].val;
-    q2 += q_cache[row[k+2].col]*row[k+2].val;
-    q3 += q_cache[row[k+3].col]*row[k+3].val;
-  }
-  q = (q0+q1+q2+q3);
-  for (; k < cnt; ++k) {
-    q += q_cache[row[k].col]*row[k].val;
-  }
-}
 inline void lda::compute_q(const int &doc, const int &word, const int &curr_topic) {
   q_cache[curr_topic] = (alpha+ndk.get(doc, curr_topic))/(deno_cache[curr_topic]);
   q = 0;
@@ -336,12 +335,73 @@ inline void lda::update_cache(const int &doc, const int &old_topic, const int &n
   compute_r_cache(doc, old_topic, new_topic);
   compute_q_cache(doc, old_topic, new_topic);
 }
+inline void lda::assign_last_z() {
+  int M = trn_data.size();
+  for (int m = 0; m < M; ++m) {
+    int N = trn_data[m].size();
+    for (int n = 0; n < N; ++n) {
+      last_z[m][n] = z[m][n];
+    }
+  }
+}
+inline void lda::compute_update() {
+  update_element_vec.resize(0);
+  int M = trn_data.size();
+  for (int m = 0; m < M; ++m) {
+    int N = trn_data[m].size();
+    for (int n = 0; n < N; ++n) {
+      if (last_z[m][n] != z[m][n]) {
+        nwk_update.sub(n, last_z[m][n], 1);
+        nwk_update.add(n, z[m][n], 1);
+      }
+      nksump[z[m][n]]++; 
+    }
+  }
+  Word_t val, c, next_c;
+  bool ret;
+  mat_element e;
+  for (int w = 0; w < words_dict_sz; w++) {
+    ret = nwk_update.get_row_first(val, c, w);
+    if (ret) {
+      update_element_vec.push_back(w);
+      update_element_vec.push_back(c);
+      update_element_vec.push_back(val);
+    }
+    while (1) {
+      ret = nwk_update.get_row_next(val, next_c, w, c);
+      if (!ret) break;
+      update_element_vec.push_back(w);
+      update_element_vec.push_back(next_c);
+      update_element_vec.push_back(val);
+      c = next_c;
+    }
+  }
+  //std::cout << update_element_vec.size() << std::endl;
+  update_element = (int*)malloc(2*update_element_vec.size()*sizeof(int));
+  for (int i = 0; i < update_element_vec.size(); ++i) {
+    update_element[i] = update_element_vec[i];
+  }
+}
+inline void lda::update() {
+  for (int n = 0; n < np; ++n) {
+    MPI_Bcast(update_element, update_element_vec.size(), MPI_INT, n, MPI_COMM_WORLD);
+    for (int i = 0; i < 3*update_element_vec.size(); i+=3) {
+      nwk.add(update_element[i], update_element[i+1], update_element[i+2]);
+    }
+    if (rank != n) {
+      for (int i = 0; i < update_element_vec.size(); ++i) {
+        update_element[i] = update_element_vec[i];
+      }
+    }
+  }
+}
 void lda::estimate() {
   compute_deno_cache();
   compute_s();
   int old_topic, new_topic;
   for (int i = 0; i < iter; ++i) {
-    std::cout << "iteration: " << i << std::endl;
+    //std::cout << "iteration: " << i << std::endl;
+    assign_last_z();
     int M = trn_data.size();
     for (int m = 0; m < M; ++m) {
       //std::cout << "iter" << i << " "<< "doc:" << m << std::endl;
@@ -357,7 +417,9 @@ void lda::estimate() {
         }
       }
     }
-    //std::cout << "iteration: " << i << " " << perplexity() << std::endl;
+    compute_update();
+    update();
+    std::cout << "iteration: " << i << " " << perplexity() << std::endl;
   }
 }
 inline int lda::sampling(const int &m, const int &n) {
