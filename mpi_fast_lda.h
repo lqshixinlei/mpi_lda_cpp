@@ -4,6 +4,7 @@
 #include <iostream>
 #include <vector>
 #include <map>
+#include <tr1/unordered_map>
 #include <string>
 #include <fstream>
 #include <algorithm>
@@ -11,12 +12,14 @@
 #include <stdlib.h>
 #include <time.h>
 #include <stdint.h>
+#include <math.h>
 #include <Judy.h>
 #include "mpi.h"
 #include "str_pre.h"
 #include "sparse_matrix.h"
 
 using namespace std;
+using namespace tr1;
 
 class lda {
 public:
@@ -45,6 +48,7 @@ public:
   void compute_theta();
   void compute_phi();
   void save_model_twords();
+  double perplexity();
   int topic;
   double alpha;
   double beta;
@@ -52,12 +56,12 @@ public:
   int rank;
   int np;
   int words_dict_sz;
-  map<string, int> word_id_dict;
-  map<int, string> id_word_dict;
+  unordered_map<string, int> word_id_dict;
+  unordered_map<int, string> id_word_dict;
   vector< vector<int> > trn_data;
   sparse_matrix nwk, nwkp, ndk; 
   double s, r, q, **theta, **phi, ab, bv, *deno_cache, *s_cache, *r_cache, *q_cache;
-  int **z;
+  int **z, **last_z;
   int *nksum, *ndsum;
   row_element *row;
 };
@@ -119,7 +123,7 @@ void lda::read_words_dict(const string &words_dict_file) {
   while (1) {
     getline(in, line);
     if (in.eof()) break;
-    map<string, int>::iterator it = word_id_dict.find(line);
+    unordered_map<string, int>::iterator it = word_id_dict.find(line);
     if (it == word_id_dict.end()) {
       word_id_dict[line] = word_id;
       id_word_dict[word_id] = line;
@@ -147,11 +151,11 @@ void lda::read_trn_data(const string &trn_data_file) {
     }
     trn_data.push_back(data);
   }
-  std:d:cout << "train data size: " << trn_data.size() << std::endl;
-  /*for (int m = 0; m < trn_data.size(); m++) {
-    int N = trn_data[m].size();
-    for (int n = 0; n < N; n++) {
-      std::cout << trn_data[m][n] << " ";
+  std::cout << "train data size: " << trn_data.size() << std::endl;
+  /*for (int i = 0; i < trn_data.size(); ++i) {
+    int N = trn_data[i].size();
+    for (int j = 0; j < N; j++) {
+      std::cout << id_word_dict[trn_data[i][j]] << " ";
     }
     std::cout << std::endl;
   }*/
@@ -167,19 +171,20 @@ void lda::init_est() {
     z[m] = (int *)malloc(N*sizeof(N));
   }
   nksum = (int *)malloc(topic*sizeof(int));
+  for (int k = 0; k < topic; k++) nksum[k] = 0;
+  ndsum = (int *)malloc(M*sizeof(int));
+  for (int m = 0; m < M; m++) ndsum[m] = 0;
   nwk.row = words_dict_sz;
   nwk.col = topic;
   nwk.init_matrix();
-  nwkp.row = words_dict_sz;
-  nwkp.col = topic;
-  nwkp.init_matrix();
-  ndsum = (int *)malloc(M*sizeof(int));
   ndk.row = M;
   ndk.col = topic;
   ndk.init_matrix();
+  nwkp.row = words_dict_sz;
+  nwkp.col = topic;
+  nwkp.init_matrix();
   srandom((int)time(0));
   for (int m = 0; m < M; ++m) {
-    //std::cout << m << std::endl;
     int N = trn_data[m].size();
     for (int n = 0; n < N; ++n) {
       int w = trn_data[m][n];
@@ -187,12 +192,20 @@ void lda::init_est() {
       int w_topic = z[m][n];
       nwk.add(w, w_topic, 1);
       ndk.add(m, w_topic, 1);
+      nksum[w_topic] += 1;
     }
     ndsum[m] += N;
   }
-  /*for (int i = 0; i < words_dict_sz; i++) {
-    std::cout << "row: " << i << " " << nwk.row_cnt(i) << std::endl;
-  }*/
+  int K = topic;
+  theta = (double **)malloc(M*sizeof(double*));
+  for (int i = 0; i < M; ++i) {
+    theta[i] = (double *)malloc(K*sizeof(double));
+  }
+  int V = words_dict_sz;
+  phi = (double **)malloc(K*sizeof(double*));
+  for (int i = 0; i < K; ++i) {
+    phi[i] = (double*)malloc(V*sizeof(double));
+  }
 }
 inline void lda::compute_s() {
   int K = topic;
@@ -222,11 +235,6 @@ inline void lda::compute_r(const int &doc) {
   compute_r_cache(doc);
   r = 0;
   int cnt;
-  /*bool ret = ndk.get_row(cnt, row, doc);
-  if (ret == false) {printf("compute_r ret false\n");}
-  for (int k = 0; k < cnt; ++k) {
-    r += r_cache[row[k].col];
-  }*/
   Word_t c, next_c, val;
   bool ret = ndk.get_row_first(val, c, doc);
   r += r_cache[c];
@@ -238,12 +246,6 @@ inline void lda::compute_r(const int &doc) {
   }
 }
 inline void lda::compute_r_cache(const int &doc) {
-  /*int cnt;
-  bool ret = ndk.get_row(cnt, row, doc);
-  if (ret == false) {printf("compute_r_cache ret false\n");}
-  for (int k = 0; k < cnt; ++k) {
-    r_cache[row[k].col] = row[k].val*beta/(deno_cache[row[k].col]);
-  }*/
   Word_t c, next_c, val;
   bool ret = ndk.get_row_first(val, c, doc);
   r_cache[c] = val*beta/deno_cache[c];
@@ -270,10 +272,6 @@ inline void lda::compute_q(const int &doc, const int &word) {
   int cnt; 
   double q0, q1, q2, q3;
   bool ret = nwk.get_row(cnt, row, word);
-  /*if (ret == false) { 
-    printf("cnt %d\n", cnt);
-    printf("compute_q ret false\n");
-  }*/
   int k = 0;
   for (; (k+4) < cnt; k+=4) {
     q0 += q_cache[row[k].col]*row[k].val;
@@ -289,23 +287,9 @@ inline void lda::compute_q(const int &doc, const int &word) {
 inline void lda::compute_q(const int &doc, const int &word, const int &curr_topic) {
   q_cache[curr_topic] = (alpha+ndk.get(doc, curr_topic))/(deno_cache[curr_topic]);
   q = 0;
-  /*int cnt;
-  double q0, q1, q2, q3;
-  bool ret = nwk.get_row(cnt, row, word);
-  //if (ret == false) printf("compute_q ret false\n");
-  int k = 0;
-  for (; (k+2) < cnt; k+=2) {
-    q0 += q_cache[row[k].col]*row[k].val;
-    q1 += q_cache[row[k+1].col]*row[k+1].val;
-  }
-  q = (q0+q1);
-  for (; k < cnt; ++k) {
-    q += q_cache[row[k].col]*row[k].val;
-  }*/
   Word_t val, c, next_c;
   bool ret = nwk.get_row_first(val, c, word);
   if (ret == false) {
-    //printf("compute_q false\n");
     return;
   }
   q += q_cache[c]*val;
@@ -320,12 +304,6 @@ inline void lda::compute_q_cache(const int &doc) {
   for (int k = 0; k < topic; ++k) {
     q_cache[k] = alpha/(deno_cache[k]);
   }
-  /*int cnt;
-  bool ret = ndk.get_row(cnt, row, doc);
-  if (ret == false) {printf("compute_q_cache ret false\n");}
-  for (int k = 0; k < cnt; ++k) {
-    q_cache[row[k].col] += row[k].val/(deno_cache[row[k].col]);
-  }*/
   Word_t val, c, next_c;
   bool ret = ndk.get_row_first(val, c, doc);
   q_cache[c] += val/deno_cache[c];
@@ -363,14 +341,13 @@ void lda::estimate() {
   compute_s();
   int old_topic, new_topic;
   for (int i = 0; i < iter; ++i) {
-    std::cout << "iteration: " << i << endl;
+    std::cout << "iteration: " << i << std::endl;
     int M = trn_data.size();
     for (int m = 0; m < M; ++m) {
-      std::cout << "iter" << i << " "<< "doc:" << m << std::endl;
+      //std::cout << "iter" << i << " "<< "doc:" << m << std::endl;
       compute_r(m);
       compute_q_cache(m);
       int N = trn_data[m].size();
-      //std::cout << "compute q cache complete!\n";
       for (int n = 0; n < N; ++n) {
         old_topic = z[m][n];
         new_topic = sampling(m, n);
@@ -380,6 +357,7 @@ void lda::estimate() {
         }
       }
     }
+    //std::cout << "iteration: " << i << " " << perplexity() << std::endl;
   }
 }
 inline int lda::sampling(const int &m, const int &n) {
@@ -445,10 +423,6 @@ inline int lda::sampling(const int &m, const int &n) {
 void lda::compute_theta() {
   int M = trn_data.size();
   int K = topic;
-  theta = (double **)malloc(M*sizeof(double*));
-  for (int i = 0; i < K; ++i) {
-    theta[i] = (double *)malloc(K*sizeof(double));
-  }
   for (int m = 0; m < M; ++m) {
     for (int k = 0; k < K; ++k) {
       theta[m][k] = (ndk.get(m,k)+alpha)/(ndsum[m]+K*alpha);
@@ -458,10 +432,6 @@ void lda::compute_theta() {
 void lda::compute_phi() {
   int K = topic;
   int V = words_dict_sz;
-  phi = (double **)malloc(K*sizeof(double*));
-  for (int i = 0; i < K; ++i) {
-    phi[i] = (double*)malloc(V*sizeof(double));
-  }
   for (int k = 0; k < K; ++k) {
     for (int w = 0; w < V; ++w) {
       phi[k][w] =  (nwk.get(w,k)+beta)/(nksum[k]+V*beta);
@@ -492,6 +462,26 @@ void lda::save_model_twords() {
       std::cout << "\t" << id_word_dict[word_prob_lst[i].first] << " " << word_prob_lst[i].second<< endl;
     }
   }
+}
+double lda::perplexity() {
+  compute_theta();
+  compute_phi();
+  double p1 = 0, p2, d = 0;
+  int M = trn_data.size();
+  for (int m = 0; m < M; ++m) {
+    int N = trn_data[m].size();
+    d += N;
+    for (int n = 0; n < N; ++n) {
+      p2 = 0;
+      for (int k = 0; k < topic; ++k) {
+        p2 += phi[k][trn_data[m][n]]*theta[m][k];
+        p2 += phi[k][trn_data[m][n]];
+      }
+      p2 = log(p2);
+      p1 += p2;
+    }
+  }
+  return exp(-1*p1/d);
 }
 void test() {
   std::pair<int, double> *lst = (std::pair<int, double>*)malloc(10*sizeof(std::pair<int, double>));
