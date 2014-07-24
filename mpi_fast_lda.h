@@ -45,6 +45,8 @@ public:
   void assign_last_z();
   void compute_update();
   void update();
+  void comm_init();
+  void clear();
   void estimate();
   int sampling(const int &m, const int &n);
   void compute_theta();
@@ -382,6 +384,41 @@ inline void lda::compute_update() {
     update_element[i] = update_element_vec[i];
   }
 }
+inline void lda::comm_init() {
+  update_element_vec.resize(0);
+  int M = trn_data.size();
+  for (int m = 0; m < M; ++m) {
+    int N = trn_data[m].size();
+    for (int n = 0; n < N; ++n) {
+      nksump[z[m][n]]++;
+    }
+  }
+  Word_t val, c, next_c;
+  bool ret;
+  mat_element e;
+  for (int w = 0; w < words_dict_sz; w++) {
+    ret = nwk.get_row_first(val, c, w);
+    if (ret) {
+      update_element_vec.push_back(w);
+      update_element_vec.push_back(c);
+      update_element_vec.push_back(val);
+    }
+    while (1) {
+      ret = nwk.get_row_next(val, next_c, w, c);
+      if (!ret) break;
+      update_element_vec.push_back(w);
+      update_element_vec.push_back(next_c);
+      update_element_vec.push_back(val);
+      c = next_c;
+    }
+  }
+  //std::cout << update_element_vec.size() << std::endl;
+  update_element = (int*)malloc(2*update_element_vec.size()*sizeof(int));
+  for (int i = 0; i < update_element_vec.size(); ++i) {
+    update_element[i] = update_element_vec[i];
+  }
+  update();
+}
 inline void lda::update() {
   for (int n = 0; n < np; ++n) {
     MPI_Bcast(update_element, update_element_vec.size(), MPI_INT, n, MPI_COMM_WORLD);
@@ -394,11 +431,17 @@ inline void lda::update() {
       }
     }
   }
+  MPI_Allreduce(nksump, nksum, topic, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+}
+inline void lda::clear() {
+  if (update_element != NULL) free(update_element);
+  for (int i = 0; i < topic; ++i) nksump[i] = 0;
 }
 void lda::estimate() {
   compute_deno_cache();
   compute_s();
   int old_topic, new_topic;
+  comm_init();
   for (int i = 0; i < iter; ++i) {
     //std::cout << "iteration: " << i << std::endl;
     assign_last_z();
@@ -419,6 +462,7 @@ void lda::estimate() {
     }
     compute_update();
     update();
+    clear();
     std::cout << "iteration: " << i << " " << perplexity() << std::endl;
   }
 }
