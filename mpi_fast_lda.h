@@ -63,7 +63,7 @@ public:
   unordered_map<string, int> word_id_dict;
   unordered_map<int, string> id_word_dict;
   vector< vector<int> > trn_data;
-  sparse_matrix nwk, nwkp, ndk, nwk_update; 
+  sparse_matrix nwk, ndk, nwk_update; 
   double s, r, q, **theta, **phi, ab, bv, *deno_cache, *s_cache, *r_cache, *q_cache;
   int **z, **last_z;
   int *nksum, *ndsum, *nksump;
@@ -196,9 +196,6 @@ void lda::init_est() {
   ndk.row = M;
   ndk.col = topic;
   ndk.init_matrix();
-  nwkp.row = words_dict_sz;
-  nwkp.col = topic;
-  nwkp.init_matrix();
   nwk_update.row = words_dict_sz;
   nwk_update.col = topic;
   nwk_update.init_matrix();
@@ -214,16 +211,6 @@ void lda::init_est() {
       nksum[w_topic] += 1;
     }
     ndsum[m] += N;
-  }
-  int K = topic;
-  theta = (double **)malloc(M*sizeof(double*));
-  for (int i = 0; i < M; ++i) {
-    theta[i] = (double *)malloc(K*sizeof(double));
-  }
-  int V = words_dict_sz;
-  phi = (double **)malloc(K*sizeof(double*));
-  for (int i = 0; i < K; ++i) {
-    phi[i] = (double*)malloc(V*sizeof(double));
   }
 }
 inline void lda::compute_s() {
@@ -353,8 +340,14 @@ inline void lda::compute_update() {
     int N = trn_data[m].size();
     for (int n = 0; n < N; ++n) {
       if (last_z[m][n] != z[m][n]) {
-        nwk_update.sub(n, last_z[m][n], 1);
-        nwk_update.add(n, z[m][n], 1);
+        //nwk_update.sub(trn_data[m][n], last_z[m][n], 1);
+        //nwk_update.add(trn_data[m][n], z[m][n], 1);
+        update_element_vec.push_back(trn_data[m][n]);
+        update_element_vec.push_back(last_z[m][n]);
+        update_element_vec.push_back(-1);
+        update_element_vec.push_back(trn_data[m][n]);
+        update_element_vec.push_back(z[m][n]);
+        update_element_vec.push_back(1);
       }
       nksump[z[m][n]]++; 
     }
@@ -412,7 +405,6 @@ inline void lda::comm_init() {
       c = next_c;
     }
   }
-  //std::cout << update_element_vec.size() << std::endl;
   update_element = (int*)malloc(2*update_element_vec.size()*sizeof(int));
   for (int i = 0; i < update_element_vec.size(); ++i) {
     update_element[i] = update_element_vec[i];
@@ -420,18 +412,29 @@ inline void lda::comm_init() {
   update();
 }
 inline void lda::update() {
+  int bcast_cnt;
   for (int n = 0; n < np; ++n) {
-    MPI_Bcast(update_element, update_element_vec.size(), MPI_INT, n, MPI_COMM_WORLD);
-    for (int i = 0; i < 3*update_element_vec.size(); i+=3) {
-      nwk.add(update_element[i], update_element[i+1], update_element[i+2]);
-    }
+    if (rank == n) bcast_cnt = update_element_vec.size();
+    MPI_Bcast(&bcast_cnt, 1, MPI_INT, n, MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_Bcast(update_element, bcast_cnt, MPI_INT, n, MPI_COMM_WORLD);
+    MPI_Barrier(MPI_COMM_WORLD);
     if (rank != n) {
+      for (int i = 0; i < bcast_cnt; i+=3) {
+        if (update_element[i+2] > 0)
+          nwk.add(update_element[i], update_element[i+1], update_element[i+2]);
+        else
+          nwk.sub(update_element[i], update_element[i+1], -1*update_element[i+2]);
+        //if (update_element[i+2] < 0)
+        //  cout << update_element[i] << " " << update_element[i+1] << " " << update_element[i+2] << endl;
+      }
       for (int i = 0; i < update_element_vec.size(); ++i) {
         update_element[i] = update_element_vec[i];
       }
     }
   }
   MPI_Allreduce(nksump, nksum, topic, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Barrier(MPI_COMM_WORLD);
 }
 inline void lda::clear() {
   if (update_element != NULL) free(update_element);
@@ -463,7 +466,9 @@ void lda::estimate() {
     compute_update();
     update();
     clear();
-    std::cout << "iteration: " << i << " " << perplexity() << std::endl;
+    if (rank == 0)
+      //std::cout << "iteration: " << i << " " << perplexity() << std::endl;
+      std::cout << "iteration: " << i << std::endl;
   }
 }
 inline int lda::sampling(const int &m, const int &n) {
@@ -529,6 +534,12 @@ inline int lda::sampling(const int &m, const int &n) {
 void lda::compute_theta() {
   int M = trn_data.size();
   int K = topic;
+  if (theta == NULL) {
+    theta = (double **)malloc(M*sizeof(double*));
+    for (int i = 0; i < M; ++i) {
+      theta[i] = (double *)malloc(K*sizeof(double));
+    }
+  }
   for (int m = 0; m < M; ++m) {
     for (int k = 0; k < K; ++k) {
       theta[m][k] = (ndk.get(m,k)+alpha)/(ndsum[m]+K*alpha);
@@ -538,11 +549,25 @@ void lda::compute_theta() {
 void lda::compute_phi() {
   int K = topic;
   int V = words_dict_sz;
+  double max = 0;
+  int n, sum;
+  if (phi == NULL) {
+    phi = (double **)malloc(K*sizeof(double*));
+    for (int i = 0; i < K; ++i) {
+      phi[i] = (double*)malloc(V*sizeof(double));
+    }
+  }
   for (int k = 0; k < K; ++k) {
     for (int w = 0; w < V; ++w) {
       phi[k][w] =  (nwk.get(w,k)+beta)/(nksum[k]+V*beta);
+      /*if (phi[k][w] > max) {
+        max = phi[k][w];
+        n = nwk.get(w, k);
+        sum = nksum[k];
+      }*/
     }
   }
+  //std::cout << "phi max:" << max << " " << n << " " << sum << std::endl;
 }
 int compare(const void *a, const void *b) {
   double sub =  (*(std::pair<int, double>*)b).second - (*(std::pair<int, double>*)a).second;
