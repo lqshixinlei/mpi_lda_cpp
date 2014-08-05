@@ -44,7 +44,7 @@ public:
   void compute_q_cache(const int &doc, const int &old_topic, const int &new_topic);
   void assign_last_z();
   void compute_update();
-  void update();
+  void update(const int &curr_iter);
   void comm_init();
   void clear();
   void estimate();
@@ -53,6 +53,8 @@ public:
   void compute_phi();
   void save_model_twords();
   double perplexity();
+  void master_init();
+  void master_proc(const int &curr_iter);
   int topic;
   double alpha;
   double beta;
@@ -85,6 +87,7 @@ lda::lda(const int &t, const double &a, const double &b, const int &i) {
   nksum = NULL;
   ndsum = NULL;
   nksump = NULL;
+  update_element = NULL;
   deno_cache = (double *)malloc(topic*sizeof(double));
   s_cache = (double *)malloc(topic*sizeof(double));
   r_cache = (double *)malloc(topic*sizeof(double));
@@ -202,6 +205,7 @@ void lda::init_est() {
   srandom((int)time(0));
   for (int m = 0; m < M; ++m) {
     int N = trn_data[m].size();
+    if (rank == 0) std::cout << "init doc: " << m << std::endl;
     for (int n = 0; n < N; ++n) {
       int w = trn_data[m][n];
       z[m][n] = int(rand()/(double)(RAND_MAX)*topic);
@@ -241,7 +245,8 @@ inline void lda::compute_r(const int &doc) {
   compute_r_cache(doc);
   r = 0;
   int cnt;
-  Word_t c, next_c, val;
+  Word_t c, next_c;
+  long val;
   bool ret = ndk.get_row_first(val, c, doc);
   r += r_cache[c];
   while (1) {
@@ -252,7 +257,8 @@ inline void lda::compute_r(const int &doc) {
   }
 }
 inline void lda::compute_r_cache(const int &doc) {
-  Word_t c, next_c, val;
+  Word_t c, next_c;
+  long val;
   bool ret = ndk.get_row_first(val, c, doc);
   r_cache[c] = val*beta/deno_cache[c];
   while (1) {
@@ -275,7 +281,8 @@ inline void lda::compute_r_cache(const int &doc, const int &old_topic, const int
 inline void lda::compute_q(const int &doc, const int &word, const int &curr_topic) {
   q_cache[curr_topic] = (alpha+ndk.get(doc, curr_topic))/(deno_cache[curr_topic]);
   q = 0;
-  Word_t val, c, next_c;
+  Word_t c, next_c;
+  long val;
   bool ret = nwk.get_row_first(val, c, word);
   if (ret == false) {
     return;
@@ -292,7 +299,8 @@ inline void lda::compute_q_cache(const int &doc) {
   for (int k = 0; k < topic; ++k) {
     q_cache[k] = alpha/(deno_cache[k]);
   }
-  Word_t val, c, next_c;
+  Word_t c, next_c;
+  long val;
   bool ret = ndk.get_row_first(val, c, doc);
   q_cache[c] += val/deno_cache[c];
   while (1) {
@@ -340,19 +348,14 @@ inline void lda::compute_update() {
     int N = trn_data[m].size();
     for (int n = 0; n < N; ++n) {
       if (last_z[m][n] != z[m][n]) {
-        //nwk_update.sub(trn_data[m][n], last_z[m][n], 1);
-        //nwk_update.add(trn_data[m][n], z[m][n], 1);
-        update_element_vec.push_back(trn_data[m][n]);
-        update_element_vec.push_back(last_z[m][n]);
-        update_element_vec.push_back(-1);
-        update_element_vec.push_back(trn_data[m][n]);
-        update_element_vec.push_back(z[m][n]);
-        update_element_vec.push_back(1);
+        nwk_update.sub(trn_data[m][n], last_z[m][n], 1);
+        nwk_update.add(trn_data[m][n], z[m][n], 1);
       }
       nksump[z[m][n]]++; 
     }
   }
-  Word_t val, c, next_c;
+  Word_t c, next_c;
+  long val;
   bool ret;
   mat_element e;
   for (int w = 0; w < words_dict_sz; w++) {
@@ -371,33 +374,97 @@ inline void lda::compute_update() {
       c = next_c;
     }
   }
-  //std::cout << update_element_vec.size() << std::endl;
-  update_element = (int*)malloc(2*update_element_vec.size()*sizeof(int));
+  if (update_element != NULL) {
+    free(update_element);
+    update_element = NULL;
+  }
+  update_element = (int*)malloc(update_element_vec.size()*sizeof(int));
   for (int i = 0; i < update_element_vec.size(); ++i) {
     update_element[i] = update_element_vec[i];
   }
 }
 inline void lda::comm_init() {
-  update_element_vec.resize(0);
-  int M = trn_data.size();
-  for (int m = 0; m < M; ++m) {
-    int N = trn_data[m].size();
-    for (int n = 0; n < N; ++n) {
-      nksump[z[m][n]]++;
+  if (rank != 0) {
+    update_element_vec.resize(0);
+    int M = trn_data.size();
+    for (int m = 0; m < M; ++m) {
+      int N = trn_data[m].size();
+      for (int n = 0; n < N; ++n) {
+        nksump[z[m][n]]++;
+      }
+    }
+    Word_t c, next_c;
+    long val;
+    bool ret;
+    mat_element e;
+    for (int w = 0; w < words_dict_sz; w++) {
+      ret = nwk.get_row_first(val, c, w);
+      if (ret) {
+        update_element_vec.push_back(w);
+        update_element_vec.push_back(c);
+        update_element_vec.push_back(val);
+      }
+      while (1) {
+        ret = nwk.get_row_next(val, next_c, w, c);
+        if (!ret) break;
+        update_element_vec.push_back(w);
+        update_element_vec.push_back(next_c);
+        update_element_vec.push_back(val);
+        c = next_c;
+      }
+    }
+    if (update_element != NULL) {
+      free(update_element);
+    }
+    update_element = (int*)malloc(update_element_vec.size()*sizeof(int));
+    for (int i = 0; i < update_element_vec.size(); ++i) {
+      update_element[i] = update_element_vec[i];
     }
   }
-  Word_t val, c, next_c;
+  if (rank == 0) master_init();
+  update(90000/(2*np));
+  clear();
+}
+inline void lda::master_init() {
+  nwk.row = words_dict_sz;
+  nwk.col = topic;
+  nwk.init_matrix();
+  nwk_update.row = words_dict_sz;
+  nwk_update.col = topic;
+  nwk_update.init_matrix();
+  nksum = (int *)malloc(topic*sizeof(int));
+  nksump = (int *)malloc(topic*sizeof(int));
+  for (int k = 0; k < topic; k++) {
+    nksum[k] = 0;
+    nksump[k] = 0;
+  }
+  int recv_cnt;
+  MPI_Status status;
+  for (int n = 1; n < np; ++n) {
+    MPI_Recv(&recv_cnt, 1, MPI_INT, n, 90000+n*2, MPI_COMM_WORLD, &status);
+    update_element = (int *)malloc(recv_cnt*sizeof(int));
+    MPI_Recv(update_element, recv_cnt, MPI_INT, n, 90000+n*2+1, MPI_COMM_WORLD, &status);
+    //std::cout << "recv from rank: "<< n << " recv_cnt:" << recv_cnt << std::endl;
+    for(int i = 0; i < recv_cnt; i += 3) {
+      nwk_update.add(update_element[i], update_element[i+1], update_element[i+2]);
+    } 
+  }
+  std::cout << "****************************" << std::endl;
+  std::cout << "rank : " << rank << std::endl;
+  nwk_update.display();
+  std::cout << "****************************" << std::endl;
+  Word_t c, next_c;
+  long val;
   bool ret;
-  mat_element e;
   for (int w = 0; w < words_dict_sz; w++) {
-    ret = nwk.get_row_first(val, c, w);
+    ret = nwk_update.get_row_first(val, c, w);
     if (ret) {
       update_element_vec.push_back(w);
       update_element_vec.push_back(c);
       update_element_vec.push_back(val);
     }
     while (1) {
-      ret = nwk.get_row_next(val, next_c, w, c);
+      ret = nwk_update.get_row_next(val, next_c, w, c);
       if (!ret) break;
       update_element_vec.push_back(w);
       update_element_vec.push_back(next_c);
@@ -405,70 +472,145 @@ inline void lda::comm_init() {
       c = next_c;
     }
   }
-  update_element = (int*)malloc(2*update_element_vec.size()*sizeof(int));
+  if (update_element != NULL) {
+    free(update_element);
+    update_element = NULL;
+  }
+  update_element = (int*)malloc(update_element_vec.size()*sizeof(int));
   for (int i = 0; i < update_element_vec.size(); ++i) {
     update_element[i] = update_element_vec[i];
   }
-  update();
 }
-inline void lda::update() {
-  int bcast_cnt;
-  for (int n = 0; n < np; ++n) {
-    if (rank == n) bcast_cnt = update_element_vec.size();
-    MPI_Bcast(&bcast_cnt, 1, MPI_INT, n, MPI_COMM_WORLD);
-    MPI_Barrier(MPI_COMM_WORLD);
-    MPI_Bcast(update_element, bcast_cnt, MPI_INT, n, MPI_COMM_WORLD);
-    MPI_Barrier(MPI_COMM_WORLD);
-    if (rank != n) {
-      for (int i = 0; i < bcast_cnt; i+=3) {
-        if (update_element[i+2] > 0)
-          nwk.add(update_element[i], update_element[i+1], update_element[i+2]);
-        else
-          nwk.sub(update_element[i], update_element[i+1], -1*update_element[i+2]);
-        //if (update_element[i+2] < 0)
-        //  cout << update_element[i] << " " << update_element[i+1] << " " << update_element[i+2] << endl;
-      }
-      for (int i = 0; i < update_element_vec.size(); ++i) {
-        update_element[i] = update_element_vec[i];
-      }
+inline void lda::master_proc(const int &i) {
+  update_element_vec.resize(0);
+  for (int n = 1; n < np; ++n) {
+    int recv_cnt;
+    MPI_Status status;
+    MPI_Recv(&recv_cnt, 1, MPI_INT, n, i*np*2+n*2, MPI_COMM_WORLD, &status);
+    if (update_element != NULL) {
+      free(update_element);
+    }
+    update_element = (int *)malloc(recv_cnt*sizeof(int));
+    MPI_Recv(update_element, recv_cnt, MPI_INT, n, i*np*2+n*2+1, MPI_COMM_WORLD, &status);
+    for (int j = 0; j < recv_cnt; j += 3) {
+      nwk_update.add(update_element[j], update_element[j+1], update_element[j+2]);
     }
   }
+  Word_t c, next_c;
+  long val;
+  bool ret;
+  for (int w = 0; w < words_dict_sz; w++) {
+    ret = nwk_update.get_row_first(val, c, w);
+    if (ret) {
+      update_element_vec.push_back(w);
+      update_element_vec.push_back(c);
+      update_element_vec.push_back(val);
+    }
+    while (1) {
+      ret = nwk_update.get_row_next(val, next_c, w, c);
+      if (!ret) break;
+      update_element_vec.push_back(w);
+      update_element_vec.push_back(next_c);
+      update_element_vec.push_back(val);
+      c = next_c;
+    }
+  }
+  if (update_element != NULL) {
+    free(update_element);
+    update_element = NULL;
+  }
+  update_element = (int*)malloc(update_element_vec.size()*sizeof(int));
+  for (int j = 0; j < update_element_vec.size(); ++j) {
+    update_element[j] = update_element_vec[j];
+  }
+}
+inline void lda::update(const int &curr_iter) {
+  if (rank != 0) {
+    int send_cnt = update_element_vec.size();
+    MPI_Send(&send_cnt, 1, MPI_INT, 0, curr_iter*np*2+rank*2, MPI_COMM_WORLD);
+    MPI_Send(update_element, send_cnt, MPI_INT, 0, curr_iter*np*2+rank*2+1, MPI_COMM_WORLD);
+  }
+  int bcast_cnt = update_element_vec.size();
+  MPI_Bcast(&bcast_cnt, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  if (rank != 0) {
+    if (update_element != NULL) free(update_element);
+    update_element = (int *)malloc(bcast_cnt*sizeof(int));
+  }
+  MPI_Bcast(update_element, bcast_cnt, MPI_INT, 0, MPI_COMM_WORLD);
+  if (rank != 0) {
+    //std::cout << "++++++++++++++++++++++++++++" << std::endl;
+    //std::cout << "rank : " << rank << std::endl;
+    //nwk.display();
+    //std::cout << "++++++++++++++++++++++++++++" << std::endl;
+    for (int i = 0; i < update_element_vec.size(); i += 3) {
+      nwk.sub(update_element_vec[i], update_element_vec[i+1], update_element_vec[i+2]);
+    }
+    for (int i = 0; i < bcast_cnt; i += 3) {
+      nwk.add(update_element[i], update_element[i+1], update_element[i+2]);
+    }
+  }
+  if (rank == 0) {
+    /*if (curr_iter == 15000) {
+      std::cout << "++++++++++++++++++++++++++++" << std::endl;
+      std::cout << "rank : " << rank << std::endl;
+      nwk_update.display();
+      std::cout << "++++++++++++++++++++++++++++" << std::endl;
+    }*/
+  }
   MPI_Allreduce(nksump, nksum, topic, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-  MPI_Barrier(MPI_COMM_WORLD);
 }
 inline void lda::clear() {
-  if (update_element != NULL) free(update_element);
+  if (update_element != NULL) {
+    free(update_element);
+    update_element = NULL;
+  }
+  nwk_update.clear_matrix();
   for (int i = 0; i < topic; ++i) nksump[i] = 0;
 }
 void lda::estimate() {
-  compute_deno_cache();
-  compute_s();
   int old_topic, new_topic;
-  comm_init();
+  if (rank != 0) {
+    compute_deno_cache();
+    compute_s();
+    comm_init();
+  }
+  if (rank == 1) std::cout << perplexity() << std::endl;
   for (int i = 0; i < iter; ++i) {
-    //std::cout << "iteration: " << i << std::endl;
-    assign_last_z();
-    int M = trn_data.size();
-    for (int m = 0; m < M; ++m) {
-      //std::cout << "iter" << i << " "<< "doc:" << m << std::endl;
-      compute_r(m);
-      compute_q_cache(m);
-      int N = trn_data[m].size();
-      for (int n = 0; n < N; ++n) {
-        old_topic = z[m][n];
-        new_topic = sampling(m, n);
-        z[m][n] = new_topic;
-        if (old_topic != new_topic) {
-          update_cache(m, old_topic, new_topic);
+    /*if (rank == 1)
+      std::cout << "iteration: " << i << std::endl;*/
+    if (rank != 0) {
+      assign_last_z();
+      int M = trn_data.size();
+      for (int m = 0; m < M; ++m) {
+        //std::cout << "iter" << i << " "<< "doc:" << m << std::endl;
+        compute_r(m);
+        compute_q_cache(m);
+        int N = trn_data[m].size();
+        for (int n = 0; n < N; ++n) {
+          old_topic = z[m][n];
+          new_topic = sampling(m, n);
+          z[m][n] = new_topic;
+          if (old_topic != new_topic) {
+            update_cache(m, old_topic, new_topic);
+          }
         }
       }
+      compute_update();
     }
-    compute_update();
-    update();
+    if (rank == 0) {
+      master_proc(i);
+    }
+    if (i == 0 && rank == 2) {
+      //nwk.display();
+      //std::cout << "++++++++++++++++++++++++" << std::endl;
+    }
+    update(i);
+    if (i == 0 && rank == 2) {
+      //nwk.display();
+    }
     clear();
-    if (rank == 0)
-      //std::cout << "iteration: " << i << " " << perplexity() << std::endl;
-      std::cout << "iteration: " << i << std::endl;
+    if (rank == 1)
+      std::cout << "iteration: " << i << " " << perplexity() << std::endl;
   }
 }
 inline int lda::sampling(const int &m, const int &n) {
@@ -487,7 +629,8 @@ inline int lda::sampling(const int &m, const int &n) {
   //Word_t val = 0, c, next_c;
   if (u >= s + r) {
     curr_sum = s + r;
-    Word_t c, val = 0, next_c;
+    Word_t c, next_c;
+    long val = 0;
     bool ret = nwk.get_row_first(val, c, w);
     curr_sum += q_cache[c]*val;
     while (true) {
@@ -502,7 +645,8 @@ inline int lda::sampling(const int &m, const int &n) {
     }
   } else if (u >= s && u < s+r) {
     curr_sum = s;
-    Word_t c, val = 0, next_c;
+    Word_t c, next_c;
+    long val = 0;
     bool ret = ndk.get_row_first(val, c, m);
     curr_sum += r_cache[c]*val;
     while (true) {
@@ -560,14 +704,9 @@ void lda::compute_phi() {
   for (int k = 0; k < K; ++k) {
     for (int w = 0; w < V; ++w) {
       phi[k][w] =  (nwk.get(w,k)+beta)/(nksum[k]+V*beta);
-      /*if (phi[k][w] > max) {
-        max = phi[k][w];
-        n = nwk.get(w, k);
-        sum = nksum[k];
-      }*/
+      //printf("k:%d, w:%d, nwk:%d, nksum:%d\n", k, w, nwk.get(w, k), nksum[k]);
     }
   }
-  //std::cout << "phi max:" << max << " " << n << " " << sum << std::endl;
 }
 int compare(const void *a, const void *b) {
   double sub =  (*(std::pair<int, double>*)b).second - (*(std::pair<int, double>*)a).second;
